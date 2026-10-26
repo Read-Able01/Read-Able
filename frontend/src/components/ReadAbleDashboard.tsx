@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { authApi, documentApi, readingApi, type DocumentItem, type RecentDocumentItem } from "@/lib/api";
 import SettingsPage from "./SettingsPage";
@@ -7,9 +7,15 @@ import {
   saveUserSettings,
   subscribeToUserSettings,
   subscribeToReadingGoal,
+  subscribeToReadingStats,
+  syncReadingStatsWithBackend,
+  loadUserReadingActivity,
+  calculateClientReadingStreak,
+  calculateClientWeekDays,
   speakText,
   stopSpeech,
 } from "@/lib/appSettings";
+import { type WeekDayStat } from "@/lib/api";
 import {
   LayoutDashboard,
   BookOpen,
@@ -160,8 +166,28 @@ export default function ReadAbleDashboard({ initialNav = "Dashboard" }: { initia
 
   const [goalMinutes, setGoalMinutes] = useState(initialSettings.goal.goalMinutes || 50);
   const [goalDone, setGoalDone] = useState(initialSettings.goal.completedMinutes || 0);
+  const [streak, setStreak] = useState<number>(() => {
+    const act = loadUserReadingActivity();
+    return calculateClientReadingStreak(act);
+  });
+  const [weekDays, setWeekDays] = useState<WeekDayStat[]>(() => {
+    const act = loadUserReadingActivity();
+    return calculateClientWeekDays(act);
+  });
 
-  // Real-time synchronization for settings and daily goal
+  // Sync stats from backend when user is loaded
+  useEffect(() => {
+    syncReadingStatsWithBackend(currentUser?.id).then((stats) => {
+      if (stats) {
+        setStreak(stats.streak);
+        setWeekDays(stats.weekDays);
+        setGoalDone(stats.todayMinutes);
+        setGoalMinutes(stats.goalMinutes);
+      }
+    });
+  }, [currentUser?.id]);
+
+  // Real-time synchronization for settings, goal, and streak stats
   useEffect(() => {
     const unsubSettings = subscribeToUserSettings((s) => {
       setTheme(s.appearance.theme);
@@ -172,12 +198,22 @@ export default function ReadAbleDashboard({ initialNav = "Dashboard" }: { initia
     const unsubGoal = subscribeToReadingGoal((g) => {
       setGoalMinutes(g.goalMinutes);
       setGoalDone(g.completedMinutes);
+      const act = loadUserReadingActivity(currentUser?.id);
+      setStreak(calculateClientReadingStreak(act));
+      setWeekDays(calculateClientWeekDays(act));
+    });
+    const unsubStats = subscribeToReadingStats((stats) => {
+      setStreak(stats.streak);
+      setWeekDays(stats.weekDays);
+      setGoalDone(stats.todayMinutes);
+      setGoalMinutes(stats.goalMinutes);
     });
     return () => {
       unsubSettings();
       unsubGoal();
+      unsubStats();
     };
-  }, []);
+  }, [currentUser?.id]);
 
   const [zoomIndex, setZoomIndex] = useState(0);
 
@@ -198,6 +234,12 @@ export default function ReadAbleDashboard({ initialNav = "Dashboard" }: { initia
   const [docToDelete, setDocToDelete] = useState<DocumentItem | null>(null);
   const [deleting, setDeleting] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // -- Search state -------------------------------------------------------
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchWrapRef = useRef<HTMLDivElement>(null);
 
   // -- helpers ---------------------------------------------------------
 
@@ -414,6 +456,7 @@ const handleFileSelected = async (
       setGoalMinutes(val);
       const current = loadUserSettings(currentUser?.id);
       saveUserSettings({ ...current, goal: { ...current.goal, goalMinutes: val } }, currentUser?.id);
+      readingApi.updateGoal(val).catch(() => {});
     }
   };
 
@@ -458,6 +501,44 @@ const handleFileSelected = async (
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [increaseSize]);
+
+  // -- Ctrl+K focuses search -----------------------------------------------
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        setSearchOpen(true);
+      }
+      if (e.key === 'Escape') {
+        setSearchOpen(false);
+        setSearchQuery('');
+      }
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, []);
+
+  // -- Close search dropdown on outside click --------------------------
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
+        setSearchOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  // -- Filtered search results (memoised) ------------------------------
+  const searchResults = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+    return documents.filter((d) =>
+      d.title.toLowerCase().includes(q) ||
+      d.fileName.toLowerCase().includes(q)
+    ).slice(0, 8);
+  }, [searchQuery, documents]);
 
   // -- preview box styling ----------------------------------------------
 
@@ -731,10 +812,78 @@ const handleFileSelected = async (
               <Menu size={18} />
             </button>
 
-            <div className="search">
+            <div className="search" ref={searchWrapRef} style={{ position: 'relative' }}>
               <Search size={16} />
-              <input placeholder="Search documents, notes, books..." />
-              <span className="kbd-hint">Ctrl + K</span>
+              <input
+                ref={searchInputRef}
+                placeholder="Search documents, notes, books..."
+                value={searchQuery}
+                onChange={(e) => { setSearchQuery(e.target.value); setSearchOpen(true); }}
+                onFocus={() => setSearchOpen(true)}
+                autoComplete="off"
+              />
+              {searchQuery ? (
+                <button
+                  onClick={() => { setSearchQuery(''); setSearchOpen(false); }}
+                  style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--text-3)', display: 'flex', padding: 2 }}
+                  title="Clear search"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              ) : (
+                <span className="kbd-hint">Ctrl + K</span>
+              )}
+              {searchOpen && searchQuery.trim() !== '' && (
+                <div style={{
+                  position: 'absolute',
+                  top: 'calc(100% + 8px)',
+                  left: 0,
+                  right: 0,
+                  background: 'var(--card)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 12,
+                  boxShadow: '0 8px 24px rgba(20,15,50,0.14)',
+                  zIndex: 50,
+                  overflow: 'hidden',
+                  maxHeight: 320,
+                  overflowY: 'auto',
+                }}>
+                  {searchResults.length === 0 ? (
+                    <div style={{ padding: '14px 16px', color: 'var(--text-3)', fontSize: '0.8125rem', textAlign: 'center' }}>
+                      No documents found for "{searchQuery}"
+                    </div>
+                  ) : (
+                    searchResults.map((d) => (
+                      <div
+                        key={d.id}
+                        onClick={() => {
+                          setSearchQuery('');
+                          setSearchOpen(false);
+                          navigate({ to: '/documents/$id/read', params: { id: String(d.id) }, search: { page: 1 } });
+                        }}
+                        style={{
+                          padding: '10px 16px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          borderBottom: '1px solid var(--border)',
+                          transition: 'background 0.1s',
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--card-soft)')}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: '0.8125rem', fontWeight: 500, color: 'var(--text-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.title}</div>
+                          <div style={{ fontSize: '0.6875rem', color: 'var(--text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.fileName}</div>
+                        </div>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="resize-wrap">
@@ -1376,16 +1525,45 @@ const handleFileSelected = async (
               <Flame size={17} />
               Reading streak
             </div>
-            <div className="streak-num">0</div>
-            <div style={{ color: "var(--text-3)", fontSize: 12 }}>days — start reading to build a streak!</div>
+            <div className="streak-num">{streak}</div>
+            <div style={{ color: "var(--text-3)", fontSize: 12 }}>
+              {streak === 1 ? "day" : "days"} — {streak > 0 ? "keep the momentum going!" : "start reading to build a streak!"}
+            </div>
             <div className="streak-days">
-              <span>M</span>
-              <span>T</span>
-              <span>W</span>
-              <span>T</span>
-              <span>F</span>
-              <span>S</span>
-              <span>S</span>
+              {weekDays.map((item, idx) => (
+                <span
+                  key={`${item.day}-${idx}`}
+                  title={`${item.date}: ${item.minutes} min${item.minutes === 1 ? "" : "s"}${item.isToday ? " (Today)" : ""}`}
+                  style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: "0.6875rem",
+                    fontWeight: item.isToday || item.completed ? 700 : 500,
+                    background: item.completed
+                      ? "var(--success)"
+                      : item.isToday
+                      ? "var(--accent-tint)"
+                      : "var(--card-soft)",
+                    color: item.completed
+                      ? "#FFFFFF"
+                      : item.isToday
+                      ? "var(--accent)"
+                      : "var(--text-3)",
+                    border: item.isToday
+                      ? "2px solid var(--accent)"
+                      : item.completed
+                      ? "none"
+                      : "1px solid var(--border)",
+                    boxShadow: item.isToday ? "0 0 0 1px var(--accent-tint)" : "none",
+                  }}
+                >
+                  {item.completed ? "✓" : item.day}
+                </span>
+              ))}
             </div>
           </div>
 
